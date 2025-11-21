@@ -1,0 +1,170 @@
+// tac.ailang - Concatenate and print files in reverse
+// Usage: tac [file]
+
+FixedPool.TacConstants {
+    "BUFFER_SIZE": Initialize=65536
+    "MAX_LINES": Initialize=100000
+}
+
+Function.WriteStdout {
+    Input: buffer: Address
+    Input: len: Integer
+    Body: {
+        SystemCall(1, 1, buffer, len)
+    }
+}
+
+Function.ProcessTac {
+    Input: fd: Integer
+    Body: {
+        // Read entire file
+        file_buffer = Allocate(1048576)  // 1MB max
+        total_bytes = 0
+        
+        WhileLoop 1 {
+            bytes_read = SystemCall(0, fd, Add(file_buffer, total_bytes), TacConstants.BUFFER_SIZE)
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                BreakLoop
+            }
+            total_bytes = Add(total_bytes, bytes_read)
+            IfCondition GreaterEqual(total_bytes, 1000000) ThenBlock: {
+                BreakLoop
+            }
+        }
+        
+        // Collect line boundaries (positions of newlines)
+        line_ends = Allocate(Multiply(TacConstants.MAX_LINES, 8))
+        line_count = 0
+        
+        i = 0
+        WhileLoop LessThan(i, total_bytes) {
+            ch = GetByte(file_buffer, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                StoreValue(Add(line_ends, Multiply(line_count, 8)), i)
+                line_count = Add(line_count, 1)
+            }
+            i = Add(i, 1)
+        }
+        
+        // Output lines in reverse order
+        IfCondition GreaterThan(line_count, 0) ThenBlock: {
+            line_idx = Subtract(line_count, 1)
+            prev_end = -1
+            
+            WhileLoop GreaterEqual(line_idx, 0) {
+                line_end = Dereference(Add(line_ends, Multiply(line_idx, 8)))
+                
+                // Determine start of this line
+                IfCondition EqualTo(line_idx, 0) ThenBlock: {
+                    line_start = 0
+                } ElseBlock: {
+                    line_start = Add(Dereference(Add(line_ends, Multiply(Subtract(line_idx, 1), 8))), 1)
+                }
+                
+                line_len = Subtract(line_end, line_start)
+                
+                // Output line (including newline)
+                WriteStdout(Add(file_buffer, line_start), Add(line_len, 1))
+                
+                line_idx = Subtract(line_idx, 1)
+            }
+        
+                    
+            // Handle last partial line (if no trailing newline)
+            IfCondition LessThan(line_start, total_bytes) ThenBlock: {
+                remaining = Subtract(total_bytes, line_start)
+                WriteStdout(Add(file_buffer, line_start), remaining)
+                WriteStdout("\n", 1)
+            }
+        } ElseBlock: {
+            // No newlines - just output the whole thing
+            IfCondition GreaterThan(total_bytes, 0) ThenBlock: {
+                WriteStdout(file_buffer, total_bytes)
+                WriteStdout("\n", 1)
+            }
+        }
+        
+        Deallocate(line_ends, Multiply(TacConstants.MAX_LINES, 8))
+        Deallocate(file_buffer, 1048576)
+    }
+}
+
+Function.GetArgs {
+    Output: Address
+    Body: {
+        fd = SystemCall(257, -100, "/proc/self/cmdline", 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        buffer = Allocate(4096)
+        bytes_read = SystemCall(0, fd, buffer, 4096)
+        SystemCall(3, fd)
+        
+        IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+            Deallocate(buffer, 4096)
+            ReturnValue(0)
+        }
+        
+        ReturnValue(buffer)
+    }
+}
+
+SubRoutine.Main {
+    args_buffer = GetArgs()
+    
+    IfCondition EqualTo(args_buffer, 0) ThenBlock: {
+        ProcessTac(0)
+        SystemCall(60, 0)
+    }
+    
+    // Skip program name
+    pos = 0
+    WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+        pos = Add(pos, 1)
+    }
+    pos = Add(pos, 1)
+    
+    // Get filename
+    filename = 0
+    ch = GetByte(args_buffer, pos)
+    
+    IfCondition NotEqual(ch, 0) ThenBlock: {
+        file_start = pos
+        file_len = 0
+        
+        WhileLoop And(LessThan(pos, 4096), NotEqual(GetByte(args_buffer, pos), 0)) {
+            file_len = Add(file_len, 1)
+            pos = Add(pos, 1)
+        }
+        
+        filename = Allocate(Add(file_len, 1))
+        i = 0
+        WhileLoop LessThan(i, file_len) {
+            ch = GetByte(args_buffer, Add(file_start, i))
+            SetByte(filename, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(filename, file_len, 0)
+    }
+    
+    Deallocate(args_buffer, 4096)
+    
+    IfCondition EqualTo(filename, 0) ThenBlock: {
+        ProcessTac(0)
+    } ElseBlock: {
+        fd = SystemCall(2, filename, 0, 0)
+        
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            SystemCall(60, 1)
+        }
+        
+        ProcessTac(fd)
+        SystemCall(3, fd)
+        Deallocate(filename, 0)
+    }
+    
+    SystemCall(60, 0)
+}
+
+RunTask(Main)

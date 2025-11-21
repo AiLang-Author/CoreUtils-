@@ -1,0 +1,1695 @@
+// grep.ailang - Version 15.0 with Context Support
+
+LibraryImport.Grep_Extended
+
+FixedPool.GrepConfig {
+    "case_insensitive": Initialize=0     
+    "invert_match": Initialize=0        
+    "show_line_numbers": Initialize=0   
+    "count_only": Initialize=0           
+    "files_with_matches": Initialize=0  
+    "quiet_mode": Initialize=0           
+    "show_filename": Initialize=0
+    "recursive": Initialize=0
+    "include_pattern": Initialize=0
+    "max_depth": Initialize=100
+    "after_lines": Initialize=0
+    "before_lines": Initialize=0
+    "context_enabled": Initialize=0
+    "max_matches": Initialize=0          
+    "matches_remaining": Initialize=0    
+}
+
+FixedPool.GrepStats {
+    "file_matches": Initialize=0
+}
+
+FixedPool.GrepConstants {
+    "BUFFER_SIZE": Initialize=1048576
+    "MAX_LINE_LENGTH": Initialize=65536
+    "OUTPUT_BUFFER_SIZE": Initialize=524288
+    "ZERO": Initialize=0
+}
+
+FixedPool.GrepPattern {
+    "pattern": Initialize=0
+    "pattern_len": Initialize=0
+    "pattern_lower": Initialize=0
+    "bad_char_table": Initialize=0
+    "bad_char_table_lower": Initialize=0
+}
+
+FixedPool.OutputBuffer {
+    "buffer": Initialize=0
+    "position": Initialize=0
+}
+
+FixedPool.WorkBuffers {
+    "read_buffer": Initialize=0
+    "line_buffer": Initialize=0
+    "lowercase_buffer": Initialize=0
+    "pattern_buffer": Initialize=0
+}
+
+FixedPool.ContextBuffer {
+    "ring_buffer": Initialize=0
+    "ring_lines": Initialize=0
+    "ring_sizes": Initialize=0
+    "ring_position": Initialize=0
+    "ring_count": Initialize=0
+    "max_context": Initialize=0
+    "after_countdown": Initialize=0
+    "last_printed_line": Initialize=0
+    "separator_needed": Initialize=0
+}
+
+Function.InitBuffers {
+    Body: {
+        OutputBuffer.buffer = Allocate(GrepConstants.OUTPUT_BUFFER_SIZE)
+        OutputBuffer.position = 0
+        
+        WorkBuffers.read_buffer = Allocate(GrepConstants.BUFFER_SIZE)
+        WorkBuffers.line_buffer = Allocate(GrepConstants.MAX_LINE_LENGTH)
+        WorkBuffers.lowercase_buffer = Allocate(GrepConstants.MAX_LINE_LENGTH)
+        WorkBuffers.pattern_buffer = Allocate(256)
+    }
+}
+
+Function.InitContextSystem {
+    Body: {
+        max_context = GrepConfig.before_lines
+        IfCondition GreaterThan(GrepConfig.after_lines, max_context) ThenBlock: {
+            max_context = GrepConfig.after_lines
+        }
+        
+        IfCondition GreaterThan(max_context, 0) ThenBlock: {
+            GrepConfig.context_enabled = 1
+            ContextBuffer.max_context = max_context
+            
+            buffer_size = Multiply(max_context, 65536)
+            ContextBuffer.ring_buffer = Allocate(buffer_size)
+            ContextBuffer.ring_lines = Allocate(Multiply(max_context, 8))
+            ContextBuffer.ring_sizes = Allocate(Multiply(max_context, 8))
+            ContextBuffer.ring_position = 0
+            ContextBuffer.ring_count = 0
+            ContextBuffer.after_countdown = 0
+            ContextBuffer.last_printed_line = 0
+            ContextBuffer.separator_needed = 0
+        } ElseBlock: {
+            GrepConfig.context_enabled = 0
+        }
+    }
+}
+
+Function.StoreLineInContext {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: line_num: Integer
+    Body: {
+        IfCondition EqualTo(GrepConfig.context_enabled, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        pos = ContextBuffer.ring_position
+        buffer_offset = Multiply(pos, 65536)
+        
+        MemCopy(Add(ContextBuffer.ring_buffer, buffer_offset), line, line_len)
+        
+        StoreValue(Add(ContextBuffer.ring_lines, Multiply(pos, 8)), line_num)
+        StoreValue(Add(ContextBuffer.ring_sizes, Multiply(pos, 8)), line_len)
+        
+        ContextBuffer.ring_position = Modulo(Add(pos, 1), ContextBuffer.max_context)
+        
+        IfCondition LessThan(ContextBuffer.ring_count, ContextBuffer.max_context) ThenBlock: {
+            ContextBuffer.ring_count = Add(ContextBuffer.ring_count, 1)
+        }
+    }
+}
+
+Function.PrintBeforeContextWithSkip {
+    Input: filename: Address
+    Input: skip_lines: Integer
+    Body: {
+        IfCondition Or(EqualTo(GrepConfig.before_lines, 0), EqualTo(ContextBuffer.ring_count, 0)) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Calculate how many lines to actually print
+        lines_to_get = GrepConfig.before_lines
+        IfCondition GreaterThan(lines_to_get, ContextBuffer.ring_count) ThenBlock: {
+            lines_to_get = ContextBuffer.ring_count
+        }
+        
+        lines_to_print = Subtract(lines_to_get, skip_lines)
+        IfCondition LessEqual(lines_to_print, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Calculate starting position in ring buffer
+        start_pos = ContextBuffer.ring_position
+        
+        // Go back lines_to_get positions
+        i = 0
+        WhileLoop LessThan(i, lines_to_get) {
+            start_pos = Subtract(start_pos, 1)
+            IfCondition LessThan(start_pos, 0) ThenBlock: {
+                start_pos = Add(start_pos, ContextBuffer.max_context)
+            }
+            i = Add(i, 1)
+        }
+        
+        // Skip the first skip_lines entries
+        start_pos = Modulo(Add(start_pos, skip_lines), ContextBuffer.max_context)
+        
+        // Now print lines_to_print lines starting from start_pos
+        i = 0
+        WhileLoop LessThan(i, lines_to_print) {
+            pos = Modulo(Add(start_pos, i), ContextBuffer.max_context)
+            buffer_offset = Multiply(pos, 65536)
+            
+            line_num = Dereference(Add(ContextBuffer.ring_lines, Multiply(pos, 8)))
+            line_len = Dereference(Add(ContextBuffer.ring_sizes, Multiply(pos, 8)))
+            
+            IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                BufferString(filename)
+                BufferByte(45)
+            }
+            
+            IfCondition EqualTo(GrepConfig.show_line_numbers, 1) ThenBlock: {
+                BufferNumber(line_num)
+                BufferByte(45)
+            }
+            
+            BufferBytes(Add(ContextBuffer.ring_buffer, buffer_offset), line_len)
+            BufferByte(10)
+            
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.PrintBeforeContext {
+    Input: filename: Address
+    Body: {
+        IfCondition Or(EqualTo(GrepConfig.before_lines, 0), EqualTo(ContextBuffer.ring_count, 0)) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Don't include the current line (which hasn't been stored yet)
+        // We want the N lines BEFORE the current match
+        lines_to_get = GrepConfig.before_lines
+        IfCondition GreaterThan(lines_to_get, ContextBuffer.ring_count) ThenBlock: {
+            lines_to_get = ContextBuffer.ring_count
+        }
+        
+        // Calculate starting position in ring buffer
+        // ring_position points to where the NEXT line would be stored
+        // So we need to go back from there
+        start_pos = ContextBuffer.ring_position
+        
+        // Go back lines_to_get positions
+        i = 0
+        WhileLoop LessThan(i, lines_to_get) {
+            start_pos = Subtract(start_pos, 1)
+            IfCondition LessThan(start_pos, 0) ThenBlock: {
+                start_pos = Add(start_pos, ContextBuffer.max_context)
+            }
+            i = Add(i, 1)
+        }
+        
+        // Now print lines_to_get lines starting from start_pos
+        i = 0
+        WhileLoop LessThan(i, lines_to_get) {
+            pos = Modulo(Add(start_pos, i), ContextBuffer.max_context)
+            buffer_offset = Multiply(pos, 65536)
+            
+            line_num = Dereference(Add(ContextBuffer.ring_lines, Multiply(pos, 8)))
+            line_len = Dereference(Add(ContextBuffer.ring_sizes, Multiply(pos, 8)))
+            
+            IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                BufferString(filename)
+                BufferByte(45)
+            }
+            
+            IfCondition EqualTo(GrepConfig.show_line_numbers, 1) ThenBlock: {
+                BufferNumber(line_num)
+                BufferByte(45)
+            }
+            
+            BufferBytes(Add(ContextBuffer.ring_buffer, buffer_offset), line_len)
+            BufferByte(10)
+            
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.FlushOutputBuffer {
+    Body: {
+        IfCondition GreaterThan(OutputBuffer.position, 0) ThenBlock: {
+            SystemCall(1, 1, OutputBuffer.buffer, OutputBuffer.position)
+            OutputBuffer.position = 0
+        }
+    }
+}
+
+Function.BufferByte {
+    Input: byte: Integer
+    Body: {
+        IfCondition GreaterEqual(OutputBuffer.position, GrepConstants.OUTPUT_BUFFER_SIZE) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        SetByte(OutputBuffer.buffer, OutputBuffer.position, byte)
+        OutputBuffer.position = Add(OutputBuffer.position, 1)
+    }
+}
+
+Function.BufferBytes {
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        space = Subtract(GrepConstants.OUTPUT_BUFFER_SIZE, OutputBuffer.position)
+        
+        IfCondition LessThan(space, len) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        
+        MemCopy(Add(OutputBuffer.buffer, OutputBuffer.position), data, len)
+        OutputBuffer.position = Add(OutputBuffer.position, len)
+    }
+}
+
+Function.BufferString {
+    Input: str: Address
+    Body: {
+        i = 0
+        pos = OutputBuffer.position
+        
+        WhileLoop 1 {
+            ch = GetByte(str, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: {
+                BreakLoop
+            }
+            
+            IfCondition GreaterEqual(pos, GrepConstants.OUTPUT_BUFFER_SIZE) ThenBlock: {
+                OutputBuffer.position = pos
+                FlushOutputBuffer()
+                pos = 0
+            }
+            
+            SetByte(OutputBuffer.buffer, pos, ch)
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+        OutputBuffer.position = pos
+    }
+}
+
+Function.WriteStderr {
+    Input: str: Address
+    Body: {
+        len = StringLength(str)
+        SystemCall(1, 2, str, len)
+    }
+}
+
+Function.BuildBadCharTable {
+    Input: pattern: Address
+    Input: pattern_len: Integer
+    Output: Address
+    Body: {
+        table = Allocate(256)
+        
+        i = 0
+        WhileLoop LessThan(i, 256) {
+            SetByte(table, i, pattern_len)
+            i = Add(i, 1)
+        }
+        
+        i = 0
+        WhileLoop LessThan(i, Subtract(pattern_len, 1)) {
+            ch = GetByte(pattern, i)
+            skip = Subtract(Subtract(pattern_len, 1), i)
+            SetByte(table, ch, skip)
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(table)
+    }
+}
+
+Function.ToLowerInline {
+    Input: src: Address
+    Input: dest: Address
+    Input: len: Integer
+    Body: {
+        i = 0
+        
+        limit = Subtract(len, 3)
+        WhileLoop LessThan(i, limit) {
+            ch1 = GetByte(src, i)
+            ch2 = GetByte(src, Add(i, 1))
+            ch3 = GetByte(src, Add(i, 2))
+            ch4 = GetByte(src, Add(i, 3))
+            
+            IfCondition And(GreaterEqual(ch1, 65), LessEqual(ch1, 90)) ThenBlock: {
+                ch1 = Add(ch1, 32)
+            }
+            IfCondition And(GreaterEqual(ch2, 65), LessEqual(ch2, 90)) ThenBlock: {
+                ch2 = Add(ch2, 32)
+            }
+            IfCondition And(GreaterEqual(ch3, 65), LessEqual(ch3, 90)) ThenBlock: {
+                ch3 = Add(ch3, 32)
+            }
+            IfCondition And(GreaterEqual(ch4, 65), LessEqual(ch4, 90)) ThenBlock: {
+                ch4 = Add(ch4, 32)
+            }
+            
+            SetByte(dest, i, ch1)
+            SetByte(dest, Add(i, 1), ch2)
+            SetByte(dest, Add(i, 2), ch3)
+            SetByte(dest, Add(i, 3), ch4)
+            
+            i = Add(i, 4)
+        }
+        
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(src, i)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                ch = Add(ch, 32)
+            }
+            SetByte(dest, i, ch)
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.StrEquals {
+    Input: str1: Address
+    Input: str2: Address
+    Output: Integer
+    Body: {
+        len1 = StringLength(str1)
+        len2 = StringLength(str2)
+        
+        IfCondition NotEqual(len1, len2) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        result = MemCompare(str1, str2, len1)
+        
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        
+        ReturnValue(0)
+    }
+}
+
+Function.SearchBoyerMoore {
+    Input: text: Address
+    Input: text_len: Integer
+    Input: pattern: Address
+    Input: pattern_len: Integer
+    Input: bad_char_table: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(pattern_len, text_len) ThenBlock: {
+            ReturnValue(-1)
+        }
+        
+        IfCondition EqualTo(pattern_len, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        
+        IfCondition EqualTo(pattern_len, 1) ThenBlock: {
+            ch = GetByte(pattern, 0)
+            pos = MemChr(text, ch, text_len)
+            ReturnValue(pos)
+        }
+        
+        pos = Subtract(pattern_len, 1)
+        max_pos = Subtract(text_len, 1)
+        
+        WhileLoop LessEqual(pos, max_pos) {
+            text_char = GetByte(text, pos)
+            pattern_last_char = GetByte(pattern, Subtract(pattern_len, 1))
+            
+            IfCondition EqualTo(text_char, pattern_last_char) ThenBlock: {
+                match_start_pos = Subtract(pos, Subtract(pattern_len, 1))
+                candidate_ptr = Add(text, match_start_pos)
+                
+                result = MemCompare(candidate_ptr, pattern, pattern_len)
+                
+                IfCondition EqualTo(result, 0) ThenBlock: {
+                    ReturnValue(match_start_pos)
+                }
+            }
+            
+            skip = GetByte(bad_char_table, text_char)
+            IfCondition EqualTo(skip, 0) ThenBlock: {
+                skip = 1
+            }
+            pos = Add(pos, skip)
+        }
+        
+        ReturnValue(-1)
+    }
+}
+
+Function.BufferNumber {
+    Input: num: Integer
+    Body: {
+        IfCondition LessThan(num, 10) ThenBlock: {
+            BufferByte(Add(48, num))
+            ReturnValue(0)
+        }
+        
+        IfCondition LessThan(num, 100) ThenBlock: {
+            BufferByte(Add(48, Divide(num, 10)))
+            BufferByte(Add(48, Modulo(num, 10)))
+            ReturnValue(0)
+        }
+        
+        IfCondition LessThan(num, 1000) ThenBlock: {
+            BufferByte(Add(48, Divide(num, 100)))
+            temp = Modulo(num, 100)
+            BufferByte(Add(48, Divide(temp, 10)))
+            BufferByte(Add(48, Modulo(temp, 10)))
+            ReturnValue(0)
+        }
+        
+        IfCondition LessThan(num, 10000) ThenBlock: {
+            BufferByte(Add(48, Divide(num, 1000)))
+            temp = Modulo(num, 1000)
+            BufferByte(Add(48, Divide(temp, 100)))
+            temp = Modulo(temp, 100)
+            BufferByte(Add(48, Divide(temp, 10)))
+            BufferByte(Add(48, Modulo(temp, 10)))
+            ReturnValue(0)
+        }
+        
+        IfCondition LessThan(num, 0) ThenBlock: {
+            BufferByte(45)
+            num = Subtract(0, num)
+        }
+        
+        digits = 0
+        temp = num
+        WhileLoop GreaterThan(temp, 0) {
+            temp = Divide(temp, 10)
+            digits = Add(digits, 1)
+        }
+        
+        i = Subtract(digits, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            divisor = 1
+            j = 0
+            WhileLoop LessThan(j, i) {
+                divisor = Multiply(divisor, 10)
+                j = Add(j, 1)
+            }
+            
+            digit = Divide(num, divisor)
+            BufferByte(Add(48, digit))
+            num = Subtract(num, Multiply(digit, divisor))
+            i = Subtract(i, 1)
+        }
+    }
+}
+
+Function.ProcessBufferOptimized {
+    Input: buffer: Address
+    Input: bytes_read: Integer
+    Input: line_buf: Address
+    Input: line_pos: Integer
+    Input: line_num: Integer
+    Input: filename: Address
+    Output: Address
+    Body: {
+        pos = GrepConstants.ZERO
+        had_match = GrepConstants.ZERO
+        
+        WhileLoop LessThan(pos, bytes_read) {
+            remaining = Subtract(bytes_read, pos)
+            search_ptr = Add(buffer, pos)
+            
+            newline_offset = MemChr(search_ptr, 10, remaining)
+            
+            IfCondition EqualTo(newline_offset, -1) ThenBlock: {
+                bytes_to_copy = remaining
+                space_left = Subtract(GrepConstants.MAX_LINE_LENGTH, line_pos)
+                space_left = Subtract(space_left, 1)
+                
+                IfCondition GreaterThan(bytes_to_copy, space_left) ThenBlock: {
+                    bytes_to_copy = space_left
+                }
+                
+                IfCondition GreaterThan(bytes_to_copy, 0) ThenBlock: {
+                    MemCopy(Add(line_buf, line_pos), search_ptr, bytes_to_copy)
+                    line_pos = Add(line_pos, bytes_to_copy)
+                }
+                
+                BreakLoop
+            }
+            
+            bytes_to_copy = newline_offset
+            space_left = Subtract(GrepConstants.MAX_LINE_LENGTH, line_pos)
+            space_left = Subtract(space_left, 1)
+            
+            IfCondition GreaterThan(bytes_to_copy, space_left) ThenBlock: {
+                bytes_to_copy = space_left
+            }
+            
+            IfCondition GreaterThan(bytes_to_copy, 0) ThenBlock: {
+                MemCopy(Add(line_buf, line_pos), search_ptr, bytes_to_copy)
+            }
+            
+            total_line_len = Add(line_pos, bytes_to_copy)
+            line_num = Add(line_num, 1)
+            
+            result = ProcessLine(line_buf, total_line_len, line_num, filename)
+            
+            // Check different return values from ProcessLine
+            IfCondition EqualTo(result, 1) ThenBlock: {
+                had_match = 1
+                
+                IfCondition EqualTo(GrepConfig.files_with_matches, 1) ThenBlock: {
+                    result_array = Allocate(32)
+                    StoreValue(result_array, 0)
+                    StoreValue(Add(result_array, 8), line_num)
+                    StoreValue(Add(result_array, 16), had_match)
+                    StoreValue(Add(result_array, 24), 1)  // early_exit = 1
+                    ReturnValue(result_array)
+                }
+                
+                IfCondition EqualTo(GrepConfig.quiet_mode, 1) ThenBlock: {
+                    result_array = Allocate(32)
+                    StoreValue(result_array, 0)
+                    StoreValue(Add(result_array, 8), line_num)
+                    StoreValue(Add(result_array, 16), had_match)
+                    StoreValue(Add(result_array, 24), 1)  // early_exit = 1
+                    ReturnValue(result_array)
+                }
+            }
+            
+            // Check if ProcessLine returned 2 (max matches reached)
+            IfCondition EqualTo(result, 2) ThenBlock: {
+                had_match = 1
+                // Signal early exit due to max matches - immediately return
+                result_array = Allocate(32)
+                StoreValue(result_array, line_pos)  // Preserve line_pos state
+                StoreValue(Add(result_array, 8), line_num)
+                StoreValue(Add(result_array, 16), had_match)
+                StoreValue(Add(result_array, 24), 1)  // early_exit = 1
+                ReturnValue(result_array)
+            }
+            
+            // Reset for next line
+            line_pos = 0
+            pos = Add(pos, Add(newline_offset, 1))
+        }
+        
+        // Return state
+        result_array = Allocate(32)
+        StoreValue(result_array, line_pos)
+        StoreValue(Add(result_array, 8), line_num)
+        StoreValue(Add(result_array, 16), had_match)
+        StoreValue(Add(result_array, 24), 0)  // early_exit = 0
+        ReturnValue(result_array)
+    }
+}
+
+Function.ProcessLine {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: line_num: Integer
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        search_text = line
+        pattern_to_search = GrepPattern.pattern
+        found_match = 0
+        match_pos = -1
+        
+        // Check for whole line match (-x flag)
+        IfCondition EqualTo(ExtendedConfig.whole_line, 1) ThenBlock: {
+            IfCondition EqualTo(line_len, GrepPattern.pattern_len) ThenBlock: {
+                IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                    ToLowerInline(line, WorkBuffers.lowercase_buffer, line_len)
+                    cmp_result = MemCompare(WorkBuffers.lowercase_buffer, GrepPattern.pattern_lower, line_len)
+                } ElseBlock: {
+                    cmp_result = MemCompare(line, GrepPattern.pattern, line_len)
+                }
+                
+                IfCondition EqualTo(cmp_result, 0) ThenBlock: {
+                    found_match = 1
+                    match_pos = 0
+                }
+            }
+        } ElseBlock: {
+            // Normal pattern matching
+            IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                ToLowerInline(line, WorkBuffers.lowercase_buffer, line_len)
+                search_text = WorkBuffers.lowercase_buffer
+                pattern_to_search = GrepPattern.pattern_lower
+            }
+            
+            bad_char = GrepPattern.bad_char_table
+            IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                bad_char = GrepPattern.bad_char_table_lower
+            }
+            match_pos = SearchBoyerMoore(search_text, line_len, pattern_to_search, GrepPattern.pattern_len, bad_char)
+            
+            found_match = GreaterEqual(match_pos, 0)
+            
+            // Check word boundaries if -w flag is set
+            IfCondition And(EqualTo(found_match, 1), EqualTo(ExtendedConfig.word_boundaries, 1)) ThenBlock: {
+                is_boundary = CheckWordBoundary(line, line_len, match_pos, GrepPattern.pattern_len)
+                IfCondition EqualTo(is_boundary, 0) ThenBlock: {
+                    found_match = 0
+                }
+            }
+        }
+        
+        // Handle invert match
+        IfCondition EqualTo(GrepConfig.invert_match, 1) ThenBlock: {
+            IfCondition EqualTo(found_match, 1) ThenBlock: {
+                found_match = 0
+            } ElseBlock: {
+                found_match = 1
+            }
+        }
+        
+        // Process the match if we found one
+        IfCondition EqualTo(found_match, 1) ThenBlock: {
+            GrepStats.file_matches = Add(GrepStats.file_matches, 1)
+            
+            // For count-only mode
+            IfCondition EqualTo(GrepConfig.count_only, 1) ThenBlock: {
+                // Store line in context even when counting
+                IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                    StoreLineInContext(line, line_len, line_num)
+                }
+                
+                // CHECK COUNTER for count mode
+                IfCondition GreaterThan(GrepConfig.max_matches, 0) ThenBlock: {
+                    GrepConfig.matches_remaining = Subtract(GrepConfig.matches_remaining, 1)
+                    IfCondition EqualTo(GrepConfig.matches_remaining, 0) ThenBlock: {
+                        ReturnValue(2)  // Stop processing
+                    }
+                }
+                ReturnValue(1)
+            }
+            
+            // For files-with-matches mode
+            IfCondition EqualTo(GrepConfig.files_with_matches, 1) ThenBlock: {
+                // Store line in context even for files with matches
+                IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                    StoreLineInContext(line, line_len, line_num)
+                }
+                ReturnValue(1)
+            }
+            
+            // For quiet mode
+            IfCondition EqualTo(GrepConfig.quiet_mode, 1) ThenBlock: {
+                // Store line in context even in quiet mode
+                IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                    StoreLineInContext(line, line_len, line_num)
+                }
+                ReturnValue(1)
+            }
+            
+            // Normal output mode - print the match
+            
+            // Print before context if enabled
+            IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                // Check for separator
+                IfCondition And(GreaterThan(ContextBuffer.separator_needed, 0), 
+                               GreaterThan(line_num, Add(ContextBuffer.last_printed_line, 1))) ThenBlock: {
+                    BufferString("--\n")
+                }
+                
+                // Only print before context lines that haven't been printed yet
+                lines_to_get = GrepConfig.before_lines
+                IfCondition GreaterThan(lines_to_get, ContextBuffer.ring_count) ThenBlock: {
+                    lines_to_get = ContextBuffer.ring_count
+                }
+                
+                // Calculate first line to print
+                first_line_to_print = Subtract(line_num, lines_to_get)
+                IfCondition LessEqual(first_line_to_print, ContextBuffer.last_printed_line) ThenBlock: {
+                    // Skip lines already printed
+                    lines_to_skip = Subtract(Add(ContextBuffer.last_printed_line, 1), first_line_to_print)
+                    lines_to_get = Subtract(lines_to_get, lines_to_skip)
+                    
+                    IfCondition GreaterThan(lines_to_get, 0) ThenBlock: {
+                        PrintBeforeContextWithSkip(filename, lines_to_skip)
+                    }
+                } ElseBlock: {
+                    PrintBeforeContext(filename)
+                }
+            }
+            
+            // Print the matching line (or only matching part with -o)
+            IfCondition EqualTo(ExtendedConfig.only_matching, 1) ThenBlock: {
+                // Print only the matched portion
+                IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                    BufferString(filename)
+                    BufferByte(58)
+                }
+                
+                IfCondition EqualTo(GrepConfig.show_line_numbers, 1) ThenBlock: {
+                    BufferNumber(line_num)
+                    BufferByte(58)
+                }
+                
+                IfCondition EqualTo(ExtendedConfig.show_byte_offset, 1) ThenBlock: {
+                    BufferNumber(ExtendedConfig.current_byte_offset)
+                    BufferByte(58)
+                }
+                
+                // Output just the matched text
+                BufferBytes(Add(line, match_pos), GrepPattern.pattern_len)
+                BufferByte(10)
+            } ElseBlock: {
+                // Print the whole line
+                IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                    BufferString(filename)
+                    BufferByte(58)
+                }
+                
+                IfCondition EqualTo(GrepConfig.show_line_numbers, 1) ThenBlock: {
+                    BufferNumber(line_num)
+                    BufferByte(58)
+                }
+                
+                IfCondition EqualTo(ExtendedConfig.show_byte_offset, 1) ThenBlock: {
+                    BufferNumber(ExtendedConfig.current_byte_offset)
+                    BufferByte(58)
+                }
+                
+                BufferBytes(line, line_len)
+                BufferByte(10)
+            }
+            
+            // Update tracking and set after context
+            IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                // Calculate how far after-context should extend
+                new_last_line = Add(line_num, GrepConfig.after_lines)
+                IfCondition GreaterThan(new_last_line, ContextBuffer.last_printed_line) ThenBlock: {
+                    ContextBuffer.after_countdown = GrepConfig.after_lines
+                } ElseBlock: {
+                    // We're within previous after-context, adjust countdown
+                    remaining = Subtract(ContextBuffer.last_printed_line, line_num)
+                    IfCondition GreaterThan(GrepConfig.after_lines, remaining) ThenBlock: {
+                        ContextBuffer.after_countdown = Subtract(GrepConfig.after_lines, remaining)
+                    } ElseBlock: {
+                        ContextBuffer.after_countdown = 0
+                    }
+                }
+                
+                ContextBuffer.last_printed_line = line_num
+                ContextBuffer.separator_needed = 1
+                // Store the current line AFTER printing
+                StoreLineInContext(line, line_len, line_num)
+            }
+            
+            // CRITICAL: CHECK MATCH COUNTER AFTER PRINTING
+            IfCondition GreaterThan(GrepConfig.max_matches, 0) ThenBlock: {
+                GrepConfig.matches_remaining = Subtract(GrepConfig.matches_remaining, 1)
+                IfCondition EqualTo(GrepConfig.matches_remaining, 0) ThenBlock: {
+                    ReturnValue(2)  // Signal to stop processing
+                }
+            }
+            
+            ReturnValue(1)  // Normal match found
+        } ElseBlock: {
+            // No match on this line
+            // Store line in context buffer if context is enabled
+            IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+                StoreLineInContext(line, line_len, line_num)
+            }
+            
+            // Check if we're in after context
+            IfCondition And(EqualTo(GrepConfig.context_enabled, 1), 
+                           GreaterThan(ContextBuffer.after_countdown, 0)) ThenBlock: {
+                // Only print if this line hasn't been printed yet
+                IfCondition GreaterThan(line_num, ContextBuffer.last_printed_line) ThenBlock: {
+                    // Print this line as after context
+                    IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                        BufferString(filename)
+                        BufferByte(45)
+                    }
+                    
+                    IfCondition EqualTo(GrepConfig.show_line_numbers, 1) ThenBlock: {
+                        BufferNumber(line_num)
+                        BufferByte(45)
+                    }
+                    
+                    BufferBytes(line, line_len)
+                    BufferByte(10)
+                    
+                    ContextBuffer.last_printed_line = line_num
+                }
+                ContextBuffer.after_countdown = Subtract(ContextBuffer.after_countdown, 1)
+            }
+            
+            ReturnValue(0)  // No match
+        }
+        
+        // Update byte offset for next line
+        IfCondition EqualTo(ExtendedConfig.show_byte_offset, 1) ThenBlock: {
+            ExtendedConfig.current_byte_offset = Add(ExtendedConfig.current_byte_offset, Add(line_len, 1))
+        }
+        
+        // Should never reach here
+        ReturnValue(0)
+    }
+}
+
+Function.IsBinaryFile {
+    Input: fd: Integer
+    Output: Integer
+    Body: {
+        test_buf = Allocate(512)
+        bytes = SystemCall(0, fd, test_buf, 512)
+        
+        IfCondition LessEqual(bytes, 0) ThenBlock: {
+            Deallocate(test_buf, 512)
+            ReturnValue(0)
+        }
+        
+        i = 0
+        WhileLoop LessThan(i, bytes) {
+            ch = GetByte(test_buf, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: {
+                Deallocate(test_buf, 512)
+                SystemCall(8, fd, 0, 0)
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        
+        Deallocate(test_buf, 512)
+        SystemCall(8, fd, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+Function.MatchesIncludePattern {
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        pattern = GrepConfig.include_pattern
+        IfCondition EqualTo(pattern, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        
+        pattern_len = StringLength(pattern)
+        filename_len = StringLength(filename)
+        
+        first_char = GetByte(pattern, 0)
+        
+        IfCondition EqualTo(first_char, 42) ThenBlock: {
+            ext_len = Subtract(pattern_len, 1)
+            
+            IfCondition LessThan(filename_len, ext_len) ThenBlock: {
+                ReturnValue(0)
+            }
+            
+            filename_suffix_start = Subtract(filename_len, ext_len)
+            i = 0
+            WhileLoop LessThan(i, ext_len) {
+                filename_ch = GetByte(filename, Add(filename_suffix_start, i))
+                pattern_ch = GetByte(pattern, Add(1, i))
+                IfCondition NotEqual(filename_ch, pattern_ch) ThenBlock: {
+                    ReturnValue(0)
+                }
+                i = Add(i, 1)
+            }
+            
+            ReturnValue(1)
+        }
+        
+        ReturnValue(StrEquals(filename, pattern))
+    }
+}
+
+Function.ProcessFile {
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(GrepConfig.include_pattern, 0) ThenBlock: {
+            path_len = StringLength(filename)
+            last_slash = -1
+            i = 0
+            WhileLoop LessThan(i, path_len) {
+                ch = GetByte(filename, i)
+                IfCondition EqualTo(ch, 47) ThenBlock: {
+                    last_slash = i
+                }
+                i = Add(i, 1)
+            }
+            
+            basename_start = Add(last_slash, 1)
+            // If no slash was found, basename_start should be 0.
+            IfCondition EqualTo(last_slash, -1) ThenBlock: {
+                basename_start = 0
+            }
+
+            matches = MatchesIncludePattern(Add(filename, basename_start))
+            IfCondition EqualTo(matches, 0) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        
+        fd = SystemCall(2, filename, 0, 0)
+        
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            WriteStderr("grep: ")
+            WriteStderr(filename)
+            WriteStderr(": No such file or directory\n")
+            ReturnValue(1)
+        }
+        
+        is_binary = IsBinaryFile(fd)
+        IfCondition EqualTo(is_binary, 1) ThenBlock: {
+            SystemCall(3, fd)
+            ReturnValue(1)
+        }
+        
+        GrepStats.file_matches = 0
+        
+        // Reset extended stats for new file
+        ExtendedConfig.matches_found = 0
+        ExtendedConfig.current_byte_offset = 0
+
+        // Reset context for new file
+        IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+            ContextBuffer.ring_position = 0
+            ContextBuffer.ring_count = 0
+            ContextBuffer.after_countdown = 0
+            ContextBuffer.last_printed_line = 0
+            ContextBuffer.separator_needed = 0
+        }
+        
+        line_num = 0
+        line_pos = 0
+        had_match_in_file = 0
+        
+        read_buf = WorkBuffers.read_buffer
+        line_buf = WorkBuffers.line_buffer
+        
+        keep_reading = 1
+        WhileLoop EqualTo(keep_reading, 1) {
+            bytes_read = SystemCall(0, fd, read_buf, GrepConstants.BUFFER_SIZE)
+            
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                keep_reading = 0
+                
+                IfCondition GreaterThan(line_pos, 0) ThenBlock: {
+                    line_num = Add(line_num, 1)
+                    result = ProcessLine(line_buf, line_pos, line_num, filename)
+                    IfCondition EqualTo(result, 1) ThenBlock: {
+                        had_match_in_file = 1
+                    }
+                }
+            } ElseBlock: {
+                result_array = ProcessBufferOptimized(read_buf, bytes_read, line_buf, line_pos, line_num, filename)
+
+                line_pos = Dereference(result_array)
+                line_num = Dereference(Add(result_array, 8))
+                buffer_had_match = Dereference(Add(result_array, 16))
+                early_exit = Dereference(Add(result_array, 24))
+                
+                Deallocate(result_array, 32)
+                
+                IfCondition EqualTo(buffer_had_match, 1) ThenBlock: {
+                    had_match_in_file = 1
+                }
+                
+                IfCondition EqualTo(early_exit, 1) ThenBlock: {
+                    IfCondition EqualTo(GrepConfig.files_with_matches, 1) ThenBlock: {
+                        BufferString(filename)
+                        BufferByte(10)
+                        FlushOutputBuffer()
+                    }
+                    // Also handle quiet mode early exit
+                    IfCondition EqualTo(GrepConfig.quiet_mode, 1) ThenBlock: {
+                        // Just exit, don't print anything
+                        FlushOutputBuffer()
+                    }
+                    keep_reading = 0
+                }
+            }
+        }
+        
+        SystemCall(3, fd)
+        
+        // Flush output after processing file
+        FlushOutputBuffer()
+        
+        IfCondition EqualTo(GrepConfig.count_only, 1) ThenBlock: {
+            IfCondition EqualTo(GrepConfig.show_filename, 1) ThenBlock: {
+                BufferString(filename)
+                BufferByte(58)
+            }
+            BufferNumber(GrepStats.file_matches)
+            BufferByte(10)
+            FlushOutputBuffer()
+        }
+        
+        IfCondition GreaterThan(GrepStats.file_matches, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.ProcessStdin {
+    Body: {
+        GrepStats.file_matches = 0
+        line_num = 0
+        line_pos = 0
+        
+        // Reset extended stats for stdin
+        ExtendedConfig.matches_found = 0
+        ExtendedConfig.current_byte_offset = 0
+        
+        // Reset context for stdin
+        IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+            ContextBuffer.ring_position = 0
+            ContextBuffer.ring_count = 0
+            ContextBuffer.after_countdown = 0
+            ContextBuffer.last_printed_line = 0
+            ContextBuffer.separator_needed = 0
+        }
+        
+        read_buf = WorkBuffers.read_buffer
+        line_buf = WorkBuffers.line_buffer
+        
+        keep_reading = 1
+        WhileLoop EqualTo(keep_reading, 1) {
+            bytes_read = SystemCall(0, 0, read_buf, GrepConstants.BUFFER_SIZE)
+            
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                keep_reading = 0
+                
+                IfCondition GreaterThan(line_pos, 0) ThenBlock: {
+                    line_num = Add(line_num, 1)
+                    result = ProcessLine(line_buf, line_pos, line_num, 0)
+                    // Check if max matches reached on last line
+                    IfCondition EqualTo(result, 2) ThenBlock: {
+                        keep_reading = 0  // Stop processing
+                    }
+                }
+            } ElseBlock: {
+                result_array = ProcessBufferOptimized(read_buf, bytes_read, line_buf, line_pos, line_num, 0)
+                
+                line_pos = Dereference(result_array)
+                line_num = Dereference(Add(result_array, 8))
+                had_match = Dereference(Add(result_array, 16))
+                early_exit = Dereference(Add(result_array, 24))
+                
+                Deallocate(result_array, 32)
+                
+                // CHECK FOR EARLY EXIT (THIS WAS MISSING!)
+                IfCondition EqualTo(early_exit, 1) ThenBlock: {
+                    keep_reading = 0  // Stop processing when max matches reached
+                }
+            }
+        }
+        
+        IfCondition EqualTo(GrepConfig.count_only, 1) ThenBlock: {
+            BufferNumber(GrepStats.file_matches)
+            BufferByte(10)
+        }
+        
+        // Always flush when processing stdin
+        FlushOutputBuffer()
+    }
+}
+
+Function.ProcessDirectory {
+    Input: dir_path: Address
+    Input: depth: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(depth, GrepConfig.max_depth) ThenBlock: {
+            ReturnValue(1)
+        }
+        
+        fd = SystemCall(257, -100, dir_path, 65536, 0)
+        
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        
+        buffer = Allocate(4096)
+        overall_result = 1
+        
+        WhileLoop 1 {
+            bytes_read = SystemCall(217, fd, buffer, 4096)
+            
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                BreakLoop
+            }
+            
+            pos = 0
+            WhileLoop LessThan(pos, bytes_read) {
+                reclen_lo = GetByte(buffer, Add(pos, 16))
+                reclen_hi = GetByte(buffer, Add(pos, 17))
+                reclen = Add(reclen_lo, Multiply(reclen_hi, 256))
+                
+                d_type = GetByte(buffer, Add(pos, 18))
+                name_start = Add(buffer, Add(pos, 19))
+                
+                first = GetByte(name_start, 0)
+                second = GetByte(name_start, 1)
+                third = GetByte(name_start, 2)
+                fourth = GetByte(name_start, 3)
+                fifth = GetByte(name_start, 4)
+                
+                is_dot = And(EqualTo(first, 46), EqualTo(second, 0))
+                is_dotdot = And(EqualTo(first, 46), And(EqualTo(second, 46), EqualTo(third, 0)))
+                is_git = And(EqualTo(first, 46), And(EqualTo(second, 103), And(EqualTo(third, 105), And(EqualTo(fourth, 116), EqualTo(fifth, 0)))))
+                
+                skip = Or(is_dot, Or(is_dotdot, is_git))
+                
+                IfCondition EqualTo(skip, 0) ThenBlock: {
+                    dir_len = StringLength(dir_path)
+                    name_len = StringLength(name_start)
+                    
+                    last_char = GetByte(dir_path, Subtract(dir_len, 1))
+                    needs_slash = NotEqual(last_char, 47)
+                    
+                    total_len = Add(dir_len, name_len)
+                    IfCondition EqualTo(needs_slash, 1) ThenBlock: {
+                        total_len = Add(total_len, 1)
+                    }
+                    
+                    full_path = Allocate(Add(total_len, 1))
+                    
+                    i = 0
+                    WhileLoop LessThan(i, dir_len) {
+                        SetByte(full_path, i, GetByte(dir_path, i))
+                        i = Add(i, 1)
+                    }
+                    
+                    IfCondition EqualTo(needs_slash, 1) ThenBlock: {
+                        SetByte(full_path, i, 47)
+                        i = Add(i, 1)
+                    }
+                    
+                    j = 0
+                    WhileLoop LessThan(j, name_len) {
+                        SetByte(full_path, i, GetByte(name_start, j))
+                        i = Add(i, 1)
+                        j = Add(j, 1)
+                    }
+                    SetByte(full_path, i, 0)
+                    
+                    is_dir = EqualTo(d_type, 4)
+                    
+                    IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                        result = ProcessDirectory(full_path, Add(depth, 1))
+                        // If a subdirectory found a match and we need to stop, propagate the signal
+                        IfCondition EqualTo(result, 2) ThenBlock: {
+                            Deallocate(full_path, Add(total_len, 1))
+                            overall_result = 2
+                            BreakLoop
+                        }
+                        IfCondition EqualTo(result, 0) ThenBlock: {
+                            overall_result = 0
+                        }
+                    } ElseBlock: {
+                        result = ProcessFile(full_path)
+                        IfCondition EqualTo(result, 0) ThenBlock: {
+                            overall_result = 0
+                        }
+                        // Check if ProcessFile signaled to stop everything
+                        IfCondition EqualTo(result, 2) ThenBlock: {
+                            overall_result = 2
+                            BreakLoop
+                        }
+                    }
+                    
+                    Deallocate(full_path, Add(total_len, 1))
+                }
+                
+                pos = Add(pos, reclen)
+            }
+        }
+
+        // Check if the loop was broken by a stop signal
+        IfCondition EqualTo(overall_result, 2) ThenBlock: {
+             // Propagate stop signal up
+        }
+        
+        Deallocate(buffer, 4096)
+        SystemCall(3, fd)
+        ReturnValue(overall_result)
+    }
+}
+
+Function.ProcessPath {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(GrepConfig.recursive, 1) ThenBlock: {
+            stat_buf = Allocate(144)
+            stat_result = SystemCall(4, path, stat_buf)
+
+            IfCondition EqualTo(stat_result, 0) ThenBlock: {
+                mode_high_byte = GetByte(stat_buf, 25)
+                file_type = BitwiseAnd(mode_high_byte, 240)
+                is_dir = EqualTo(file_type, 64)
+                
+                Deallocate(stat_buf, 144)
+                
+                IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                    ReturnValue(ProcessDirectory(path, 0))
+                }
+            } ElseBlock: {
+                Deallocate(stat_buf, 144)
+            }
+        }
+        
+        ReturnValue(ProcessFile(path))
+    }
+}
+
+Function.IsFlag {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        first = GetByte(str, 0)
+        second = GetByte(str, 1)
+        ReturnValue(And(EqualTo(first, 45), NotEqual(second, 0)))
+    }
+}
+
+Function.ParseContextNumber {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        len = StringLength(str)
+        num = 0
+        i = 0
+        
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(str, i)
+            IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+                num = Multiply(num, 10)
+                num = Add(num, Subtract(ch, 48))
+            }
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(num)
+    }
+}
+
+Function.ParseFlags {
+    Input: flag_str: Address
+    Body: {
+        i = 1
+        
+        WhileLoop NotEqual(GetByte(flag_str, i), 0) {
+            ch = GetByte(flag_str, i)
+            
+            IfCondition EqualTo(ch, 105) ThenBlock: {  // 'i'
+                GrepConfig.case_insensitive = 1
+            }
+            
+            IfCondition EqualTo(ch, 118) ThenBlock: {  // 'v'
+                GrepConfig.invert_match = 1
+            }
+            
+            IfCondition EqualTo(ch, 110) ThenBlock: {  // 'n'
+                GrepConfig.show_line_numbers = 1
+            }
+            
+            IfCondition EqualTo(ch, 99) ThenBlock: {  // 'c'
+                GrepConfig.count_only = 1
+            }
+            
+            IfCondition EqualTo(ch, 108) ThenBlock: {  // 'l'
+                GrepConfig.files_with_matches = 1
+            }
+            
+            IfCondition EqualTo(ch, 113) ThenBlock: {  // 'q'
+                GrepConfig.quiet_mode = 1
+            }
+            
+            IfCondition EqualTo(ch, 114) ThenBlock: {  // 'r'
+                GrepConfig.recursive = 1
+            }
+            
+            // NEW FLAGS FROM EXTENDED LIBRARY
+            IfCondition EqualTo(ch, 119) ThenBlock: {  // 'w' - word boundaries
+                ExtendedConfig.word_boundaries = 1
+            }
+            
+            IfCondition EqualTo(ch, 120) ThenBlock: {  // 'x' - whole line
+                ExtendedConfig.whole_line = 1
+            }
+            
+            IfCondition EqualTo(ch, 111) ThenBlock: {  // 'o' - only matching
+                ExtendedConfig.only_matching = 1
+            }
+            
+            IfCondition EqualTo(ch, 98) ThenBlock: {  // 'b' - byte offset
+                ExtendedConfig.show_byte_offset = 1
+            }
+            
+            IfCondition EqualTo(ch, 122) ThenBlock: {  // 'z' - null separator
+                ExtendedConfig.null_separator = 1
+            }
+            
+            // Skip A, B, C, m flags here - they're handled separately with arguments
+            IfCondition Or(EqualTo(ch, 65), Or(EqualTo(ch, 66), Or(EqualTo(ch, 67), EqualTo(ch, 109)))) ThenBlock: {
+                // Do nothing - these need a following argument
+            }
+            
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.GetArgs {
+    Output: Address
+    Body: {
+        cmdline_path = "/proc/self/cmdline"
+        fd = SystemCall(257, -100, cmdline_path, 0, 0)
+        
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        buffer = Allocate(4096)
+        bytes_read = SystemCall(0, fd, buffer, 4096)
+        SystemCall(3, fd)
+        
+        IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+            Deallocate(buffer, 4096)
+            ReturnValue(0)
+        }
+        
+        ReturnValue(buffer)
+    }
+}
+
+Function.ToLowerCaseSetup {
+    Input: str: Address
+    Output: Address
+    Body: {
+        len = StringLength(str)
+        result = Allocate(Add(len, 1))
+        
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(str, i)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                ch = Add(ch, 32)
+            }
+            SetByte(result, i, ch)
+            i = Add(i, 1)
+        }
+        
+        SetByte(result, len, 0)
+        ReturnValue(result)
+    }
+}
+
+SubRoutine.Main {
+    InitBuffers()
+    
+    args_buffer = GetArgs()
+    
+    IfCondition EqualTo(args_buffer, 0) ThenBlock: {
+        WriteStderr("Usage: grep [OPTION]... PATTERN [FILE]...\n")
+        SystemCall(60, 2)
+    }
+    
+    pos = 0
+    WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+        pos = Add(pos, 1)
+    }
+    pos = Add(pos, 1)
+    
+    pattern_found = 0
+    file_paths = Allocate(8000)
+    file_count = 0
+    skip_next = 0
+    
+    WhileLoop LessThan(pos, 4096) {
+        ch = GetByte(args_buffer, pos)
+        IfCondition EqualTo(ch, 0) ThenBlock: {
+            BreakLoop
+        }
+        
+        arg_start = pos
+        arg_len = 0
+        
+        WhileLoop And(LessThan(pos, 4096), NotEqual(GetByte(args_buffer, pos), 0)) {
+            arg_len = Add(arg_len, 1)
+            pos = Add(pos, 1)
+        }
+        
+        arg = Allocate(Add(arg_len, 1))
+        i = 0
+        WhileLoop LessThan(i, arg_len) {
+            ch = GetByte(args_buffer, Add(arg_start, i))
+            SetByte(arg, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(arg, arg_len, 0)
+        
+        IfCondition EqualTo(skip_next, 1) ThenBlock: {
+            skip_next = 0
+            Deallocate(arg, 0)
+        } ElseBlock: {
+            is_flag = IsFlag(arg)
+            
+            IfCondition EqualTo(is_flag, 1) ThenBlock: {
+                // Check for context flags that need an argument
+                context_flag = 0
+                IfCondition And(EqualTo(arg_len, 2), EqualTo(GetByte(arg, 0), 45)) ThenBlock: {
+                    second_char = GetByte(arg, 1)
+                    IfCondition EqualTo(second_char, 65) ThenBlock: {
+                        context_flag = 1  // -A
+                    }
+                    IfCondition EqualTo(second_char, 66) ThenBlock: {
+                        context_flag = 2  // -B
+                    }
+                    IfCondition EqualTo(second_char, 67) ThenBlock: {
+                        context_flag = 3  // -C
+                    }
+                    IfCondition EqualTo(second_char, 109) ThenBlock: {  // 'm' - max matches
+                        context_flag = 4
+                    }
+                }
+                
+                IfCondition GreaterThan(context_flag, 0) ThenBlock: {
+                    // Get the next argument as the number
+                    next_pos = Add(pos, 1)
+                    IfCondition LessThan(next_pos, 4096) ThenBlock: {
+                        next_start = next_pos
+                        next_len = 0
+                        
+                        WhileLoop And(LessThan(next_pos, 4096), NotEqual(GetByte(args_buffer, next_pos), 0)) {
+                            next_len = Add(next_len, 1)
+                            next_pos = Add(next_pos, 1)
+                        }
+                        
+                        IfCondition GreaterThan(next_len, 0) ThenBlock: {
+                            next_arg = Allocate(Add(next_len, 1))
+                            i = 0
+                            WhileLoop LessThan(i, next_len) {
+                                ch = GetByte(args_buffer, Add(next_start, i))
+                                SetByte(next_arg, i, ch)
+                                i = Add(i, 1)
+                            }
+                            SetByte(next_arg, next_len, 0)
+                            
+                            value = ParseContextNumber(next_arg)
+                            
+                            IfCondition EqualTo(context_flag, 1) ThenBlock: {
+                                GrepConfig.after_lines = value
+                            }
+                            IfCondition EqualTo(context_flag, 2) ThenBlock: {
+                                GrepConfig.before_lines = value
+                            }
+                            IfCondition EqualTo(context_flag, 3) ThenBlock: {
+                                GrepConfig.after_lines = value
+                                GrepConfig.before_lines = value
+                            }
+                            IfCondition EqualTo(context_flag, 4) ThenBlock: {
+                                GrepConfig.max_matches = value
+                                GrepConfig.matches_remaining = value  // Initialize counter
+                            }
+                            
+                            skip_next = 1
+                            Deallocate(next_arg, 0)
+                        }
+                    }
+                    Deallocate(arg, 0)
+                } ElseBlock: {
+                    is_help = StrEquals(arg, "--help")
+                    IfCondition EqualTo(is_help, 1) ThenBlock: {
+                        BufferString("Usage: grep [OPTION]... PATTERN [FILE]...\n")
+                        BufferString("Search for PATTERN in each FILE.\n\n")
+                        BufferString("  -i                ignore case distinctions\n")
+                        BufferString("  -v                invert match\n")
+                        BufferString("  -n                show line numbers\n")
+                        BufferString("  -c                count matching lines\n")
+                        BufferString("  -l                print files with matches\n")
+                        BufferString("  -q                quiet mode\n")
+                        BufferString("  -r                recursive search\n")
+                        BufferString("  -A NUM            print NUM lines of trailing context\n")
+                        BufferString("  -B NUM            print NUM lines of leading context\n")
+                        BufferString("  -C NUM            print NUM lines of output context\n")
+                        BufferString("  -w                match whole words only\n")
+                        BufferString("  -x                match whole line only\n")
+                        BufferString("  -o                show only the matched part\n")
+                        BufferString("  -b                print byte offset\n")
+                        BufferString("  -m NUM            stop after NUM matches\n")
+                        BufferString("  --include=GLOB    search only files matching GLOB\n")
+                        BufferString("      --help        display this help\n")
+                        BufferString("      --version     output version information\n\n")
+                        BufferString("With no FILE, read standard input.\n")
+                        BufferString("With -r and no FILE, search current directory.\n")
+                        FlushOutputBuffer()
+                        SystemCall(60, 0)
+                    }
+                    
+                    is_version = StrEquals(arg, "--version")
+                    IfCondition EqualTo(is_version, 1) ThenBlock: {
+                        BufferString("grep (AILANG coreutils) 16.0\n")
+                        BufferString("Added: Word boundaries (-w), whole line (-x), only matching (-o)\n")
+                        FlushOutputBuffer()
+                        SystemCall(60, 0)
+                    }
+                    
+                    include_prefix_match = 1
+                    include_prefix = "--include="
+                    i = 0
+                    WhileLoop LessThan(i, 10) {
+                        arg_ch = GetByte(arg, i)
+                        prefix_ch = GetByte(include_prefix, i)
+                        IfCondition NotEqual(arg_ch, prefix_ch) ThenBlock: {
+                            include_prefix_match = 0
+                            BreakLoop
+                        }
+                        i = Add(i, 1)
+                    }
+                    
+                    IfCondition EqualTo(include_prefix_match, 1) ThenBlock: {
+                        pattern_start = 10
+                        pattern_len = Subtract(arg_len, 10)
+                        pattern = Allocate(Add(pattern_len, 1))
+                        i = 0
+                        WhileLoop LessThan(i, pattern_len) {
+                            ch = GetByte(arg, Add(pattern_start, i))
+                            SetByte(pattern, i, ch)
+                            i = Add(i, 1)
+                        }
+                        SetByte(pattern, pattern_len, 0)
+                        GrepConfig.include_pattern = pattern
+                        Deallocate(arg, 0)
+                    } ElseBlock: {
+                        ParseFlags(arg)
+                        Deallocate(arg, 0)
+                    }
+                }
+            } ElseBlock: {
+                IfCondition EqualTo(pattern_found, 0) ThenBlock: {
+                    GrepPattern.pattern = arg
+                    GrepPattern.pattern_len = arg_len
+                    GrepPattern.pattern_lower = ToLowerCaseSetup(arg)
+                    GrepPattern.bad_char_table = BuildBadCharTable(GrepPattern.pattern, GrepPattern.pattern_len)
+                    GrepPattern.bad_char_table_lower = BuildBadCharTable(GrepPattern.pattern_lower, GrepPattern.pattern_len)
+                    pattern_found = 1
+                } ElseBlock: {
+                    StoreValue(Add(file_paths, Multiply(file_count, 8)), arg)
+                    file_count = Add(file_count, 1)
+                }
+            }
+        }
+        
+        pos = Add(pos, 1)
+    }
+    
+    Deallocate(args_buffer, 4096)
+    
+    IfCondition EqualTo(pattern_found, 0) ThenBlock: {
+        WriteStderr("grep: missing pattern\n")
+        WriteStderr("Try 'grep --help' for more information.\n")
+        SystemCall(60, 2)
+    }
+    
+    // Initialize context system after parsing arguments
+    InitContextSystem()
+    
+    IfCondition And(EqualTo(GrepConfig.recursive, 1), EqualTo(file_count, 0)) ThenBlock: {
+        default_path = Allocate(2)
+        SetByte(default_path, 0, 46)
+        SetByte(default_path, 1, 0)
+        StoreValue(Add(file_paths, Multiply(file_count, 8)), default_path)
+        file_count = 1
+    }
+    
+    IfCondition Or(GreaterThan(file_count, 1), EqualTo(GrepConfig.recursive, 1)) ThenBlock: {
+        GrepConfig.show_filename = 1
+    }
+    
+    exit_code = 1
+    
+    IfCondition EqualTo(file_count, 0) ThenBlock: {
+        ProcessStdin()
+        
+        IfCondition GreaterThan(GrepStats.file_matches, 0) ThenBlock: {
+            exit_code = 0
+        }
+    } ElseBlock: {
+        i = 0
+        WhileLoop LessThan(i, file_count) {
+            path = Dereference(Add(file_paths, Multiply(i, 8)))
+            
+            result = ProcessPath(path)
+            
+            IfCondition EqualTo(result, 0) ThenBlock: {
+                exit_code = 0
+            }
+            
+            Deallocate(path, 0)
+            i = Add(i, 1)
+        }
+    }
+    
+    FlushOutputBuffer()
+    
+    // Cleanup context system
+    IfCondition EqualTo(GrepConfig.context_enabled, 1) ThenBlock: {
+        Deallocate(ContextBuffer.ring_buffer, Multiply(ContextBuffer.max_context, 65536))
+        Deallocate(ContextBuffer.ring_lines, Multiply(ContextBuffer.max_context, 8))
+        Deallocate(ContextBuffer.ring_sizes, Multiply(ContextBuffer.max_context, 8))
+    }
+    
+    Deallocate(file_paths, 8000)
+    Deallocate(WorkBuffers.read_buffer, GrepConstants.BUFFER_SIZE)
+    Deallocate(WorkBuffers.line_buffer, GrepConstants.MAX_LINE_LENGTH)
+    Deallocate(WorkBuffers.lowercase_buffer, GrepConstants.MAX_LINE_LENGTH)
+    Deallocate(WorkBuffers.pattern_buffer, 256)
+    Deallocate(OutputBuffer.buffer, GrepConstants.OUTPUT_BUFFER_SIZE)
+    
+    SystemCall(60, exit_code)
+}
+
+RunTask(Main)

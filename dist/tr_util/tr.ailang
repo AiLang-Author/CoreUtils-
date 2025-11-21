@@ -1,0 +1,243 @@
+// tr.ailang - Translate or delete characters
+// Usage: tr 'abc' 'xyz'  (translate a->x, b->y, c->z)
+//        tr -d 'abc'     (delete characters)
+
+FixedPool.TrConfig {
+    "delete_mode": Initialize=0
+}
+
+FixedPool.TrConstants {
+    "BUFFER_SIZE": Initialize=65536
+}
+
+Function.WriteStdout {
+    Input: buffer: Address
+    Input: len: Integer
+    Body: {
+        SystemCall(1, 1, buffer, len)
+    }
+}
+
+Function.BuildTranslationTable {
+    Input: from_set: Address
+    Input: to_set: Address
+    Output: Address
+    Body: {
+        // Create 256-byte lookup table (identity map by default)
+        table = Allocate(256)
+        
+        // Initialize to identity
+        i = 0
+        WhileLoop LessThan(i, 256) {
+            SetByte(table, i, i)
+            i = Add(i, 1)
+        }
+        
+        // Build translation map
+        from_len = StringLength(from_set)
+        to_len = StringLength(to_set)
+        
+        i = 0
+        WhileLoop LessThan(i, from_len) {
+            from_ch = GetByte(from_set, i)
+            
+            // If to_set is shorter, use last char
+            IfCondition LessThan(i, to_len) ThenBlock: {
+                to_ch = GetByte(to_set, i)
+            } ElseBlock: {
+                to_ch = GetByte(to_set, Subtract(to_len, 1))
+            }
+            
+            SetByte(table, from_ch, to_ch)
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(table)
+    }
+}
+
+Function.BuildDeleteTable {
+    Input: delete_set: Address
+    Output: Address
+    Body: {
+        // Create 256-byte table (0=keep, 1=delete)
+        table = Allocate(256)
+        
+        // Initialize to 0 (keep all)
+        i = 0
+        WhileLoop LessThan(i, 256) {
+            SetByte(table, i, 0)
+            i = Add(i, 1)
+        }
+        
+        // Mark chars to delete
+        delete_len = StringLength(delete_set)
+        i = 0
+        WhileLoop LessThan(i, delete_len) {
+            ch = GetByte(delete_set, i)
+            SetByte(table, ch, 1)
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(table)
+    }
+}
+
+Function.ProcessTr {
+    Input: table: Address
+    Body: {
+        buffer = Allocate(TrConstants.BUFFER_SIZE)
+        
+        WhileLoop 1 {
+            bytes_read = SystemCall(0, 0, buffer, TrConstants.BUFFER_SIZE)
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                BreakLoop
+            }
+            
+            IfCondition EqualTo(TrConfig.delete_mode, 1) ThenBlock: {
+                // Delete mode - skip chars marked for deletion
+                out_pos = 0
+                i = 0
+                WhileLoop LessThan(i, bytes_read) {
+                    ch = GetByte(buffer, i)
+                    should_delete = GetByte(table, ch)
+                    
+                    IfCondition EqualTo(should_delete, 0) ThenBlock: {
+                        SetByte(buffer, out_pos, ch)
+                        out_pos = Add(out_pos, 1)
+                    }
+                    
+                    i = Add(i, 1)
+                }
+                
+                WriteStdout(buffer, out_pos)
+            } ElseBlock: {
+                // Translate mode
+                i = 0
+                WhileLoop LessThan(i, bytes_read) {
+                    ch = GetByte(buffer, i)
+                    translated = GetByte(table, ch)
+                    SetByte(buffer, i, translated)
+                    i = Add(i, 1)
+                }
+                
+                WriteStdout(buffer, bytes_read)
+            }
+        }
+        
+        Deallocate(buffer, TrConstants.BUFFER_SIZE)
+    }
+}
+
+Function.GetArgs {
+    Output: Address
+    Body: {
+        fd = SystemCall(257, -100, "/proc/self/cmdline", 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        buffer = Allocate(4096)
+        bytes_read = SystemCall(0, fd, buffer, 4096)
+        SystemCall(3, fd)
+        
+        IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+            Deallocate(buffer, 4096)
+            ReturnValue(0)
+        }
+        
+        ReturnValue(buffer)
+    }
+}
+
+SubRoutine.Main {
+    args_buffer = GetArgs()
+    
+    IfCondition EqualTo(args_buffer, 0) ThenBlock: {
+        SystemCall(60, 1)
+    }
+    
+    // Skip program name
+    pos = 0
+    WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+        pos = Add(pos, 1)
+    }
+    pos = Add(pos, 1)
+    
+    // Parse arguments
+    set1 = 0
+    set2 = 0
+    
+    WhileLoop LessThan(pos, 4096) {
+        ch = GetByte(args_buffer, pos)
+        IfCondition EqualTo(ch, 0) ThenBlock: {
+            BreakLoop
+        }
+        
+        // Check for -d flag
+        first = GetByte(args_buffer, pos)
+        IfCondition EqualTo(first, 45) ThenBlock: {
+            second = GetByte(args_buffer, Add(pos, 1))
+            IfCondition EqualTo(second, 100) ThenBlock: {
+                TrConfig.delete_mode = 1
+                
+                // Skip "-d"
+                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                    pos = Add(pos, 1)
+                }
+                pos = Add(pos, 1)
+                ContinueLoop
+            }
+        }
+        
+        // It's a set
+        arg_start = pos
+        arg_len = 0
+        
+        WhileLoop And(LessThan(pos, 4096), NotEqual(GetByte(args_buffer, pos), 0)) {
+            arg_len = Add(arg_len, 1)
+            pos = Add(pos, 1)
+        }
+        
+        arg = Allocate(Add(arg_len, 1))
+        i = 0
+        WhileLoop LessThan(i, arg_len) {
+            ch = GetByte(args_buffer, Add(arg_start, i))
+            SetByte(arg, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(arg, arg_len, 0)
+        
+        IfCondition EqualTo(set1, 0) ThenBlock: {
+            set1 = arg
+        } ElseBlock: {
+            set2 = arg
+        }
+        
+        pos = Add(pos, 1)
+    }
+    
+    Deallocate(args_buffer, 4096)
+    
+    // Build translation/delete table
+    table = 0
+    
+    IfCondition EqualTo(TrConfig.delete_mode, 1) ThenBlock: {
+        IfCondition NotEqual(set1, 0) ThenBlock: {
+            table = BuildDeleteTable(set1)
+        }
+    } ElseBlock: {
+        IfCondition And(NotEqual(set1, 0), NotEqual(set2, 0)) ThenBlock: {
+            table = BuildTranslationTable(set1, set2)
+        }
+    }
+    
+    IfCondition NotEqual(table, 0) ThenBlock: {
+        ProcessTr(table)
+        Deallocate(table, 256)
+    }
+    
+    SystemCall(60, 0)
+}
+
+RunTask(Main)

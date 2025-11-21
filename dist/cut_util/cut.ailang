@@ -1,0 +1,298 @@
+// cut.ailang - OPTIMIZED with MemCopy
+// Usage: cut -f1,3 file.txt  (fields)
+
+FixedPool.CutConfig {
+    "delimiter": Initialize=9      
+}
+
+FixedPool.CutConstants {
+    "BUFFER_SIZE": Initialize=65536
+    "OUTPUT_BUFFER_SIZE": Initialize=65536
+}
+
+FixedPool.OutputBuffer {
+    "buffer": Initialize=0
+    "position": Initialize=0
+}
+
+Function.InitOutputBuffer {
+    Body: {
+        OutputBuffer.buffer = Allocate(CutConstants.OUTPUT_BUFFER_SIZE)
+        OutputBuffer.position = 0
+    }
+}
+
+Function.FlushOutputBuffer {
+    Body: {
+        IfCondition GreaterThan(OutputBuffer.position, 0) ThenBlock: {
+            SystemCall(1, 1, OutputBuffer.buffer, OutputBuffer.position)
+            OutputBuffer.position = 0
+        }
+    }
+}
+
+Function.BufferBytes {
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        space = Subtract(CutConstants.OUTPUT_BUFFER_SIZE, OutputBuffer.position)
+        
+        IfCondition LessThan(space, len) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        
+        // Use MemCopy for speed!
+        MemCopy(Add(OutputBuffer.buffer, OutputBuffer.position), data, len)
+        OutputBuffer.position = Add(OutputBuffer.position, len)
+    }
+}
+
+Function.BufferByte {
+    Input: byte: Integer
+    Body: {
+        IfCondition GreaterEqual(OutputBuffer.position, CutConstants.OUTPUT_BUFFER_SIZE) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        SetByte(OutputBuffer.buffer, OutputBuffer.position, byte)
+        OutputBuffer.position = Add(OutputBuffer.position, 1)
+    }
+}
+
+Function.WriteStderr {
+    Input: str: Address
+    Body: {
+        len = StringLength(str)
+        SystemCall(1, 2, str, len)
+    }
+}
+
+Function.SysOpen {
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(2, filename, 0, 0))
+    }
+}
+
+Function.SysRead {
+    Input: fd: Integer
+    Input: buffer: Address
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(0, fd, buffer, count))
+    }
+}
+
+Function.StringToInt {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        result = 0
+        i = 0
+        
+        WhileLoop 1 {
+            ch = GetByte(str, i)
+            IfCondition Or(LessThan(ch, 48), GreaterThan(ch, 57)) ThenBlock: {
+                ReturnValue(result)
+            }
+            digit = Subtract(ch, 48)
+            result = Add(Multiply(result, 10), digit)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// OPTIMIZED: Use MemChr to find delimiters and newlines!
+Function.ProcessCutFields {
+    Input: fd: Integer
+    Input: field_num: Integer
+    Input: delim: Integer
+    Body: {
+        buffer = Allocate(CutConstants.BUFFER_SIZE)
+        
+        buffer_pos = 0
+        buffer_len = 0
+        line_start = 0
+        
+        WhileLoop 1 {
+            // Read more data if needed
+            IfCondition GreaterEqual(buffer_pos, buffer_len) ThenBlock: {
+                buffer_len = SysRead(fd, buffer, CutConstants.BUFFER_SIZE)
+                IfCondition LessEqual(buffer_len, 0) ThenBlock: {
+                    BreakLoop
+                }
+                buffer_pos = 0
+                line_start = 0
+            }
+            
+            // Find next newline using MemChr
+            remaining = Subtract(buffer_len, buffer_pos)
+            search_ptr = Add(buffer, buffer_pos)
+            newline_offset = MemChr(search_ptr, 10, remaining)
+            
+            IfCondition EqualTo(newline_offset, -1) ThenBlock: {
+                // No newline, need more data
+                buffer_pos = buffer_len
+                ContinueLoop
+            }
+            
+            // Process line from line_start to newline
+            line_end = Add(buffer_pos, newline_offset)
+            line_ptr = Add(buffer, line_start)
+            line_len = Subtract(line_end, line_start)
+            
+            // Find the Nth field
+            current_field = 1
+            field_start = 0
+            pos = 0
+            
+            WhileLoop LessThan(pos, line_len) {
+                ch = GetByte(line_ptr, pos)
+                
+                IfCondition EqualTo(ch, delim) ThenBlock: {
+                    // End of field
+                    IfCondition EqualTo(current_field, field_num) ThenBlock: {
+                        // Output this field using MemCopy!
+                        field_len = Subtract(pos, field_start)
+                        BufferBytes(Add(line_ptr, field_start), field_len)
+                        BufferByte(10)
+                        BreakLoop
+                    }
+                    current_field = Add(current_field, 1)
+                    field_start = Add(pos, 1)
+                }
+                
+                pos = Add(pos, 1)
+            }
+            
+            // Last field (no delimiter after it)
+            IfCondition EqualTo(current_field, field_num) ThenBlock: {
+                field_len = Subtract(line_len, field_start)
+                BufferBytes(Add(line_ptr, field_start), field_len)
+                BufferByte(10)
+            }
+            
+            // Move to next line
+            buffer_pos = Add(line_end, 1)
+            line_start = buffer_pos
+        }
+        
+        Deallocate(buffer, CutConstants.BUFFER_SIZE)
+    }
+}
+
+Function.GetArgs {
+    Output: Address
+    Body: {
+        fd = SystemCall(257, -100, "/proc/self/cmdline", 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        buffer = Allocate(4096)
+        bytes_read = SystemCall(0, fd, buffer, 4096)
+        SystemCall(3, fd)
+        
+        IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+            Deallocate(buffer, 4096)
+            ReturnValue(0)
+        }
+        
+        ReturnValue(buffer)
+    }
+}
+
+SubRoutine.Main {
+    InitOutputBuffer()
+    
+    args_buffer = GetArgs()
+    
+    IfCondition EqualTo(args_buffer, 0) ThenBlock: {
+        WriteStderr("cut: usage: cut -f FIELD [file]\n")
+        SystemCall(60, 1)
+    }
+    
+    // Skip program name
+    pos = 0
+    WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+        pos = Add(pos, 1)
+    }
+    pos = Add(pos, 1)
+    
+    field_num = 1
+    filename = 0
+    
+    // Parse args
+    WhileLoop LessThan(pos, 4096) {
+        ch = GetByte(args_buffer, pos)
+        IfCondition EqualTo(ch, 0) ThenBlock: {
+            BreakLoop
+        }
+        
+        // Check for -f flag
+        first = GetByte(args_buffer, pos)
+        IfCondition EqualTo(first, 45) ThenBlock: {
+            second = GetByte(args_buffer, Add(pos, 1))
+            IfCondition EqualTo(second, 102) ThenBlock: {
+                // -f flag
+                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                    pos = Add(pos, 1)
+                }
+                pos = Add(pos, 1)
+                
+                field_num = StringToInt(Add(args_buffer, pos))
+                
+                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                    pos = Add(pos, 1)
+                }
+                pos = Add(pos, 1)
+                ContinueLoop
+            }
+        }
+        
+        // It's a filename
+        file_start = pos
+        file_len = 0
+        
+        WhileLoop And(LessThan(pos, 4096), NotEqual(GetByte(args_buffer, pos), 0)) {
+            file_len = Add(file_len, 1)
+            pos = Add(pos, 1)
+        }
+        
+        filename = Allocate(Add(file_len, 1))
+        i = 0
+        WhileLoop LessThan(i, file_len) {
+            ch = GetByte(args_buffer, Add(file_start, i))
+            SetByte(filename, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(filename, file_len, 0)
+        
+        pos = Add(pos, 1)
+    }
+    
+    Deallocate(args_buffer, 4096)
+    
+    IfCondition EqualTo(filename, 0) ThenBlock: {
+        ProcessCutFields(0, field_num, CutConfig.delimiter)
+    } ElseBlock: {
+        fd = SysOpen(filename)
+        
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            WriteStderr("cut: cannot open file\n")
+            SystemCall(60, 1)
+        }
+        
+        ProcessCutFields(fd, field_num, CutConfig.delimiter)
+        SystemCall(3, fd)
+        Deallocate(filename, 0)
+    }
+    
+    FlushOutputBuffer()
+    Deallocate(OutputBuffer.buffer, CutConstants.OUTPUT_BUFFER_SIZE)
+    
+    SystemCall(60, 0)
+}
+
+RunTask(Main)
