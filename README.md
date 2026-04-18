@@ -145,7 +145,7 @@ If you want to rebuild the utilities:
 # Build outputs to dist/{utility}_util/ directories
 ```
 
-Requires the AILang compiler: https://github.com/AiLang-Author/AiLang
+Requires the AILang compiler: [https://github.com/AiLang-Author/AiLang](https://github.com/AiLang-Author/Ailang-Self-Hosting-)
 
 ## Repository Structure
 
