@@ -9,6 +9,7 @@ POSIX-compliant reimplementation of core Unix utilities in AILang. Drop-in repla
 
 ## Quick Start
 
+
 ```bash
 # Clone the repository
 git clone https://github.com/AiLang-Author/CoreUtils-.git
@@ -227,10 +228,10 @@ MIT
 
 ## References
 
-- **AILang Compiler**: https://github.com/AiLang-Author/AiLang
+- **AILang Compiler**: https://github.com/AiLang-Author/AiLang-Self-Hosting-
 - **POSIX.1-2017**: https://pubs.opengroup.org/onlinepubs/9699919799/
 - **GNU Coreutils**: https://www.gnu.org/software/coreutils/
 
 ---
 
-**Quality over quantity** - Each utility is carefully implemented with full testing and documentation.
+**Quality over quantity** - 
