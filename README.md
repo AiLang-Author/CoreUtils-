@@ -1,3 +1,8 @@
+
+
+Core utilities can now be found here >>>>>>>>  https://github.com/AiLang-Author/Ailang-Self-Hosting-
+
+
 # AILang Coreutils
 
 POSIX-compliant reimplementation of core Unix utilities in AILang. Drop-in replacements for GNU coreutils with competitive performance, smaller binary sizes, and explicit memory management.
